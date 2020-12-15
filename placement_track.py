@@ -8,6 +8,7 @@ from selenium.webdriver.support.ui import WebDriverWait as wait
 from selenium.webdriver.support import expected_conditions as EC
 
 import requests
+from time import time
 import numpy as np
 import pandas as pd
 from threading import Thread, Lock
@@ -75,7 +76,7 @@ def valid_page(html_content):
 
 
 def solve_captcha(session, r):
-    btf = BeautifulSoup(r.text)
+    btf = BeautifulSoup(r)
     form = btf.find('form', attrs={'action': '/errors/validateCaptcha'})
     amzn = form.find('input', attrs={'name': 'amzn'})['value']
     img_url = form.find('img')['src']
@@ -137,21 +138,43 @@ def create_session(zip_code_amazon):
     return s
 
 
-def placement_find(asin_str, keywords_df, session_list, session_lock_list, writer_excel, writer_lock):
-    keywords_df['row'] = 0
-    keywords_df['column'] = 0
-    keywords_df['page'] = 0
+class SessionThread(Thread):
+    def __init__(self, asin_find, s, zip_c, session_lock, df, number_threads=10):
+        Thread.__init__(self)
+        self.asin = asin_find
+        self.session = s
+        self.zip_code = zip_c
+        self.session_lock = session_lock
+        self.number_threads = number_threads
+        self.df = df.copy()
 
-    main_lock = Lock()
-    df = []
+    def run(self):
+        with print_lock:
+            print(f'started thread for asin {self.asin} for {self.zip_code} zip code')
+        if 0 < self.number_threads < len(self.df):
+            threads = []
+            indexes = np.round(np.linspace(0, len(self.df), self.number_threads))
+            for i, _ in enumerate(indexes):
+                if i == len(indexes) - 1:
+                    continue
+                else:
+                    threads.append(Thread(target=self.thread_run, args=[indexes[int(i)], indexes[int(i) + 1]]))
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        else:
+            self.thread_run(0, len(self.df))
 
-    def run(s, lock):
-        df_ = keywords_df.copy()
-        for index, item in df_.iterrows():
+        self.df['zip_code'] = self.zip_code
+        with print_lock:
+            print(f'ended thread for asin {self.asin} for {self.zip_code} zip code')
+
+    def thread_run(self, start, end):
+        for index, item in self.df.iloc[int(start):int(end), :].iterrows():
             keyword = item['keyword']
             for page_index in range(1, number_of_pages_to_search + 1):
-                with lock:
-                    req = s.get(amazon_url_search(keyword, page=page_index)).text
+                req = self.query(keyword, page_index)
 
                 # get SPAN with data-component-type equal s-search-results
                 if len(BeautifulSoup(req).find_all('span', attrs={'data-component-type': 's-search-results'})) != 1:
@@ -169,7 +192,7 @@ def placement_find(asin_str, keywords_df, session_list, session_lock_list, write
                         div.has_attr("data-index") and div.get('data-asin') and div.has_attr('data-component-type')
                         and div.get('data-component-type') == 's-search-result']
 
-                divs_with_asin = [div for div in divs if div.get('data-asin') == asin_str]
+                divs_with_asin = [div for div in divs if div.get('data-asin') == self.asin]
                 _ = []
                 if len(divs_with_asin):
                     for div_i in divs_with_asin:
@@ -184,17 +207,34 @@ def placement_find(asin_str, keywords_df, session_list, session_lock_list, write
                     divs_index = divs.index(product)
                     row = divs_index // 4 + 1
                     column = divs_index % 4 + 1
-                    df_.loc[df_['keyword'] == keyword, 'row'] = row
-                    df_.loc[df_['keyword'] == keyword, 'column'] = column
-                    df_.loc[df_['keyword'] == keyword, 'page'] = page_index
+                    self.df.loc[self.df['keyword'] == keyword, 'row'] = row
+                    self.df.loc[self.df['keyword'] == keyword, 'column'] = column
+                    self.df.loc[self.df['keyword'] == keyword, 'page'] = page_index
                     break
 
-        df_['zip_code'] = zip_codes[session_list.index(s)]
-        with main_lock:
-            df.append(df_)
+    def query(self, keyword, page):
+        for i in range(_MAX_TRIAL_REQUESTS):
+            with self.session_lock:
+                req = self.session.get(amazon_url_search(keyword, page=page)).text
+            if not valid_page(req):
+                if 'Enter the characters you see below' in req:
+                    solve_captcha(self.session, req)
+                else:
+                    raise Exception('not valid page from "SessionThread"')
+            else:
+                return req
 
-    thread_session = [Thread(target=run, args=[session, session_lock]) for session, session_lock in
-                      zip(session_list, session_lock_list)]
+
+def placement_find(asin_str, keywords_df, session_list, session_lock_list, writer_excel, writer_lock):
+    with print_lock:
+        print(f'Asin {asin_str} started')
+    keywords_df['row'] = 0
+    keywords_df['column'] = 0
+    keywords_df['page'] = 0
+
+    thread_session = [SessionThread(asin_find=asin_str, s=session, zip_c=zip_codes[session_list.index(session)],
+                                    session_lock=session_lock, df=keywords_df, number_threads=10) for
+                      session, session_lock in zip(session_list, session_lock_list)]
 
     for thread in thread_session:
         thread.start()
@@ -202,11 +242,16 @@ def placement_find(asin_str, keywords_df, session_list, session_lock_list, write
     for thread in thread_session:
         thread.join()
 
-    df = pd.concat(df, ignore_index=True)
+    df = pd.concat([thread.df for thread in thread_session], ignore_index=True)
     df = df.set_index(['campaign', 'keyword', 'zip_code']).sort_index()
     with writer_lock:
         df.to_excel(writer_excel, sheet_name=asin_str)
+    with print_lock:
+        print(f'Asin {asin_str} ended')
 
+
+start_time = time()
+print_lock = Lock()
 
 sessions, session_locks = [], []
 for zip_code in zip_codes:
@@ -229,3 +274,5 @@ for process in thread_asin:
     process.join()
 
 writer.save()
+
+print(time() - start_time, 'seconds')
